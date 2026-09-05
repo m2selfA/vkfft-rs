@@ -9,9 +9,11 @@ Before opening a pull request, run the portable checks that do not require a GPU
 ```bash
 cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo check --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features
 cargo test --lib --no-default-features
 ```
+
+Compiler warnings are treated as errors by the check command. Clippy is intentionally not run with a blanket `-D warnings` in public CI because its style lint set changes between Rust releases; new Clippy suggestions should still be reviewed and addressed when they improve the code without weakening compatibility or clarity.
 
 For changes that affect planning, code generation, runtime execution, precision, or backend resource ownership, also run the smallest relevant focused tests. If compatible hardware is available, include the corresponding real-device runtime tests.
 

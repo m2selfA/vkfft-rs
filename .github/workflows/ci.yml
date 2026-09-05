@@ -24,6 +24,9 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo check --all-targets --all-features
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Clippy's style lint set changes between Rust releases. Compiler
+        # warnings remain strict in the preceding check; Clippy still reports
+        # new suggestions without turning a toolchain update into a red CI.
+        run: cargo clippy --all-targets --all-features
       - name: Portable library tests
         run: cargo test --lib --no-default-features
