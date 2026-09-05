@@ -1,0 +1,10 @@
+vkfft-rs is a pure-Rust reimplementation derived from the design and algorithms of VkFFT.
+
+Upstream project: https://github.com/DTolm/VkFFT
+Initial porting baseline: 066a17c17068c0f11c9298d848c2976c71fad1c1 (VkFFT 1.3.4)
+Original author: Dmitrii Tolmachev
+Upstream license: MIT (see LICENSE)
+
+Design reference:
+Dmitrii Tolmachev, "VkFFT-A Performant, Cross-Platform and Open-Source GPU FFT Library",
+IEEE Access, 2023, DOI 10.1109/ACCESS.2023.3242240.

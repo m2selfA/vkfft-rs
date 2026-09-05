@@ -1,0 +1,4 @@
+# Scheduler, IR-construction, and shader-lowering helpers intentionally mirror
+# VkFFT's explicit state vectors. Keeping up to twelve named parameters makes
+# upstream differential review clearer than hiding those fields in ad-hoc bags.
+too-many-arguments-threshold = 12

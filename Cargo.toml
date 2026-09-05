@@ -1,0 +1,34 @@
+[package]
+name = "vkfft-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure-Rust reimplementation of VkFFT"
+readme = "README.md"
+documentation = "https://docs.rs/vkfft-rs"
+repository = "https://github.com/m2selfA/vkfft-rs"
+keywords = ["fft", "gpu", "vulkan", "cuda", "compute"]
+categories = ["algorithms", "mathematics", "science"]
+exclude = ["docs/DEVELOPMENT_CHECKPOINT.md", ".github/"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "vkfft_rs"
+path = "src/lib.rs"
+
+[features]
+default = []
+vulkan-runtime = ["dep:ash"]
+native-runtime = ["dep:libloading"]
+cuda-runtime = ["native-runtime"]
+hip-runtime = ["native-runtime"]
+opencl-runtime = ["native-runtime"]
+level-zero-runtime = ["native-runtime"]
+metal-runtime = ["native-runtime"]
+
+[dependencies]
+ash = { version = "0.38.0", optional = true }
+libloading = { version = "0.8.9", optional = true }
+naga = { version = "29.0.4", features = ["glsl-in", "spv-out"] }
