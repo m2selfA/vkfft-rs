@@ -10,13 +10,13 @@ The current release-candidate validation is **1,598/1,598 target tests passed** 
 
 ## Status
 
-`vkfft-rs` 0.1.0 is a correctness-first Rust reimplementation of VkFFT with executable GPU runtimes, not an FFI wrapper.
+`vkfft-rs` is a correctness-first Rust reimplementation of VkFFT with executable GPU runtimes, not an FFI wrapper.
 
 - **Transforms:** 1D and multidimensional C2C, R2C/C2R, DCT/DST I-IV, convolution, zero padding, strides, batching, and grouped batching.
 - **Planning and kernels:** Stockham, direct/FFT-convolution Rader, Bluestein, recursive mixed-radix planning, typed kernel/program IR, and backend-specific code generation.
 - **Precision:** F16 storage, F32/F64 compute, mixed storage, and double-double paths where supported.
 - **Backends:** Vulkan, CUDA, HIP, OpenCL, Level Zero, and Metal. Vulkan/CUDA/OpenCL/HIP/Level Zero have real-device validation; real Apple-GPU Metal validation and FP64-capable Level Zero validation remain open hardware items.
-- **Validation:** the 0.1.0 release candidate completed **1,598/1,598** target tests (1,440 library + 158 integration), with additional backend-specific real-device gates.
+- **Validation:** the current release baseline completed **1,598/1,598** target tests (1,440 library + 158 integration), with additional backend-specific real-device gates.
 
 The crate is still pre-1.0, so APIs may evolve. See [`docs/PORTING_PLAN.md`](docs/PORTING_PLAN.md) for detailed feature mapping, hardware evidence, and remaining work.
 
