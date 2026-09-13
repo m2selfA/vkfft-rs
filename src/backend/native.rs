@@ -1144,18 +1144,19 @@ fn translate_glsl_dialect_impl(
             in_rader_initializer = true;
             continue;
         }
-        if matches!(backend, Backend::OpenCl | Backend::LevelZero)
-            && raw_line == trimmed
+        if raw_line == trimmed
             && trimmed.ends_with(';')
             && (trimmed.starts_with("const uint VKFFT_")
                 || trimmed.starts_with("const int VKFFT_")
                 || trimmed.starts_with("const float VKFFT_")
                 || trimmed.starts_with("const double VKFFT_"))
         {
-            output.push_str("__constant ");
-            output.push_str(trimmed.trim_start_matches("const "));
-            output.push('\n');
-            continue;
+            if let Some(prefix) = program_scope_constant_prefix(backend) {
+                output.push_str(prefix);
+                output.push_str(trimmed.trim_start_matches("const "));
+                output.push('\n');
+                continue;
+            }
         }
         if in_rader_initializer && trimmed == ");" {
             output.push_str("};\n\n");
@@ -1896,6 +1897,14 @@ const fn role_argument_name(role: BufferRole) -> &'static str {
     }
 }
 
+const fn program_scope_constant_prefix(backend: Backend) -> Option<&'static str> {
+    match backend {
+        Backend::OpenCl | Backend::LevelZero => Some("__constant "),
+        Backend::Metal => Some("constant "),
+        Backend::Cuda | Backend::Hip | Backend::Vulkan | Backend::CpuReference => None,
+    }
+}
+
 const fn rader_constant_prefix(backend: Backend) -> &'static str {
     match backend {
         Backend::Cuda | Backend::Hip => "__device__ __constant__ ",
@@ -2189,14 +2198,22 @@ void main() {
             assert!(!source.contains("\nconst uint VKFFT_N = 34u;"));
         }
 
-        for backend in [Backend::Cuda, Backend::Metal] {
-            let source =
-                translate_glsl_dialect(backend, glsl, ScalarType::F32, workgroup, &[], &[])
-                    .unwrap();
-            assert!(source.contains("\nconst uint VKFFT_N = 34u;"));
-            assert!(source.contains("    const uint VKFFT_LOCAL = 3u;"));
-            assert!(!source.contains("__constant uint VKFFT_N = 34u;"));
-        }
+        let metal =
+            translate_glsl_dialect(Backend::Metal, glsl, ScalarType::F32, workgroup, &[], &[])
+                .unwrap();
+        assert!(metal.contains("constant uint VKFFT_N = 34u;"));
+        assert!(metal.contains("constant float VKFFT_SIGN ="));
+        assert!(metal.contains("    const uint VKFFT_LOCAL = 3u;"));
+        assert!(!metal.contains("\nconst uint VKFFT_N = 34u;"));
+        assert!(!metal.contains("__constant uint VKFFT_N = 34u;"));
+
+        let cuda =
+            translate_glsl_dialect(Backend::Cuda, glsl, ScalarType::F32, workgroup, &[], &[])
+                .unwrap();
+        assert!(cuda.contains("\nconst uint VKFFT_N = 34u;"));
+        assert!(cuda.contains("    const uint VKFFT_LOCAL = 3u;"));
+        assert!(!cuda.contains("__constant uint VKFFT_N = 34u;"));
+        assert!(!cuda.contains("\nconstant uint VKFFT_N = 34u;"));
     }
 
     #[test]
@@ -2245,6 +2262,10 @@ void main() {
                     assert!(shader.source.contains("kernel void VkFFT_main"));
                     assert!(shader.source.contains("thread_position_in_threadgroup"));
                     assert!(shader.source.contains("threadgroup_barrier"));
+                    assert!(shader.source.contains("constant float VKFFT_PI ="));
+                    assert!(shader.source.contains("constant float VKFFT_TAU ="));
+                    assert!(!shader.source.contains("\nconst float VKFFT_PI ="));
+                    assert!(!shader.source.contains("\nconst float VKFFT_TAU ="));
                 }
                 _ => unreachable!(),
             }
