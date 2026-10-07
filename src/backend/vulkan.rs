@@ -1280,6 +1280,36 @@ fn push_dd_r2r_scalar_output_store(
 }
 
 impl VulkanGlslBackend {
+    /// Lower any high-level transform into the ordered Vulkan shader stream that
+    /// corresponds one-for-one with [`crate::TransformIr::program_ir`] passes.
+    pub fn lower_transform(&self, ir: &crate::TransformIr) -> Result<Vec<VulkanShaderSource>> {
+        let shaders = match ir {
+            crate::TransformIr::Complex1d(ir) => self.lower_one_dim_fft(ir)?,
+            crate::TransformIr::Complex1dDoubleDouble(ir) => {
+                self.lower_double_double_one_dim_program(ir)?
+            }
+            crate::TransformIr::ComplexNdDoubleDouble(ir) => self.lower_double_double_nd(ir)?,
+            crate::TransformIr::ComplexNd(ir) => self.lower_nd_fft(ir)?,
+            crate::TransformIr::RealDoubleDouble(ir) => self.lower_double_double_real(ir)?,
+            crate::TransformIr::RealNdDoubleDouble(ir) => self.lower_double_double_nd_real(ir)?,
+            crate::TransformIr::Real(ir) => self.lower_real_fft(ir)?,
+            crate::TransformIr::RealNd(ir) => self.lower_nd_real_fft(ir)?,
+            crate::TransformIr::RealToRealDoubleDouble(ir) => self.lower_double_double_r2r(ir)?,
+            crate::TransformIr::RealToRealNdDoubleDouble(ir) => {
+                self.lower_double_double_nd_r2r(ir)?
+            }
+            crate::TransformIr::RealToReal(ir) => self.lower_r2r_program(ir)?,
+            crate::TransformIr::RealToRealNd(ir) => self.lower_nd_r2r(ir)?,
+        };
+        let program = ir.program_ir()?;
+        if shaders.len() != program.passes.len() {
+            return Err(VkFftError::InvalidKernelIr(
+                "high-level Vulkan transform shader/pass count mismatch",
+            ));
+        }
+        Ok(shaders)
+    }
+
     /// Direct-Rader lowering for the initial double-double prime slice. A
     /// device-materialized physical block distributes independent non-DC outputs
     /// and the DC input reduction over its FFT lanes; only the final DC store remains

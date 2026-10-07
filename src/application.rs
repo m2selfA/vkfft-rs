@@ -209,6 +209,25 @@ impl TransformIr {
         }
     }
 
+    /// Materialize the backend-neutral executable resource/pass graph for this
+    /// high-level transform without repeating family dispatch in downstream users.
+    pub fn program_ir(&self) -> Result<crate::ProgramIr> {
+        match self {
+            Self::Complex1d(ir) => crate::ProgramIr::one_dim_fft(ir),
+            Self::Complex1dDoubleDouble(ir) => crate::ProgramIr::double_double_one_dim(ir),
+            Self::ComplexNdDoubleDouble(ir) => crate::ProgramIr::double_double_nd(ir),
+            Self::ComplexNd(ir) => crate::ProgramIr::nd_fft(ir),
+            Self::RealDoubleDouble(ir) => crate::ProgramIr::double_double_real(ir),
+            Self::RealNdDoubleDouble(ir) => crate::ProgramIr::double_double_nd_real(ir),
+            Self::Real(ir) => crate::ProgramIr::real_fft(ir),
+            Self::RealNd(ir) => crate::ProgramIr::nd_real_fft(ir),
+            Self::RealToRealDoubleDouble(ir) => crate::ProgramIr::double_double_r2r(ir),
+            Self::RealToRealNdDoubleDouble(ir) => crate::ProgramIr::double_double_nd_r2r(ir),
+            Self::RealToReal(ir) => crate::ProgramIr::r2r(ir),
+            Self::RealToRealNd(ir) => crate::ProgramIr::nd_r2r(ir),
+        }
+    }
+
     pub fn execute_complex_reference(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
         match self {
             Self::Complex1d(ir) => execute_one_dim_fft_ir(ir, input),
@@ -423,6 +442,33 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn high_level_program_and_vulkan_lowering_cover_c2c_r2c_c2r_2d_3d() {
+        for dimensions in [vec![8, 6], vec![4, 6, 8]] {
+            for (transform, direction) in [
+                (TransformKind::ComplexToComplex, Direction::Forward),
+                (TransformKind::RealToComplex, Direction::Forward),
+                (TransformKind::ComplexToReal, Direction::Inverse),
+            ] {
+                let ir = TransformIr::build(
+                    FftConfig::new(dimensions.clone()).with_transform(transform),
+                    direction,
+                    device(),
+                )
+                .unwrap();
+                let program = ir.program_ir().unwrap();
+                program.validate().unwrap();
+                let shaders = crate::backend::vulkan::VulkanGlslBackend
+                    .lower_transform(&ir)
+                    .unwrap();
+                assert_eq!(shaders.len(), program.passes.len());
+                for shader in shaders {
+                    shader.compile_spirv().unwrap();
+                }
+            }
+        }
     }
 
     #[test]

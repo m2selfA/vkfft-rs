@@ -280,7 +280,10 @@ mod tests {
             "\"upstream_vkfft_commit\":\"{}\"",
             crate::UPSTREAM_VKFFT_COMMIT
         )));
-        assert!(line.contains("\"vkfft_rs_version\":\"0.1.0\""));
+        assert!(line.contains(&format!(
+            "\"vkfft_rs_version\":\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(line.contains("\"backend\":\"Cuda\""));
         assert!(line.contains("\"device\":\"GPU \\\\\\\"A\\\\\\\"\\n0\""));
         assert!(line.contains("\"family\":\"c2c-nd\""));

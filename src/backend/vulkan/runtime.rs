@@ -34,8 +34,8 @@ use crate::nd_ir::NdFftIr;
 use crate::nd_real_ir::NdRealFftIr;
 use crate::one_dim_ir::OneDimFftIr;
 use crate::program_ir::{
-    ExternalBufferLayout, ProgramAllocation, ProgramAllocationKind, ProgramElementShape, ProgramIr,
-    ProgramMemoryPlan, ProgramPass, ProgramResourceInitialization,
+    ExternalBufferLayout, ProgramAllocation, ProgramAllocationId, ProgramAllocationKind,
+    ProgramElementShape, ProgramIr, ProgramMemoryPlan, ProgramPass, ProgramResourceInitialization,
 };
 use crate::r2r_ir::{NdR2rIr, R2rIr};
 use crate::rader_ir::{RaderDirectIr, RaderFftInputStrategy, RaderFftPipelineIr};
@@ -81,6 +81,419 @@ impl VulkanBufferSlice {
             range: vk::WHOLE_SIZE,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VulkanProgramAllocationBinding {
+    pub binding: u32,
+    pub allocation: ProgramAllocationId,
+    pub access: BufferAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VulkanProgramPassRecordingPlan {
+    pub name: String,
+    pub bindings: Vec<VulkanProgramAllocationBinding>,
+}
+
+/// Backend-side projection of a [`ProgramIr`] resource graph onto physical
+/// allocations. This plan contains no Vulkan handles and can therefore be built
+/// and validated without a GPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VulkanProgramRecordingPlan {
+    pub memory_plan: ProgramMemoryPlan,
+    pub allocation_byte_lengths: Vec<vk::DeviceSize>,
+    pub passes: Vec<VulkanProgramPassRecordingPlan>,
+}
+
+impl VulkanProgramRecordingPlan {
+    pub fn new(program: &ProgramIr) -> Result<Self> {
+        program.validate()?;
+        let memory_plan = program.memory_plan()?;
+        let allocation_byte_lengths = memory_plan
+            .allocations
+            .iter()
+            .map(|allocation| program_allocation_byte_len(program, allocation))
+            .collect::<Result<Vec<_>>>()?;
+        let passes = program
+            .passes
+            .iter()
+            .map(|pass| {
+                let bindings = pass
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(VulkanProgramAllocationBinding {
+                            binding: binding.binding,
+                            allocation: memory_plan.allocation_for(binding.resource)?,
+                            access: binding.access,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(VulkanProgramPassRecordingPlan {
+                    name: pass.name.clone(),
+                    bindings,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            memory_plan,
+            allocation_byte_lengths,
+            passes,
+        })
+    }
+
+    /// Minimum storage footprint used by the existing Vulkan ProgramIr runtime
+    /// for one physical allocation.
+    pub fn allocation_bytes(&self, id: ProgramAllocationId) -> Result<vk::DeviceSize> {
+        self.memory_plan
+            .allocations
+            .get(id.0)
+            .filter(|allocation| allocation.id == id)
+            .ok_or(VkFftError::InvalidKernelIr(
+                "Vulkan recording plan references an unknown allocation",
+            ))?;
+        self.allocation_byte_lengths
+            .get(id.0)
+            .copied()
+            .ok_or(VkFftError::InvalidKernelIr(
+                "Vulkan recording plan byte length is missing",
+            ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VulkanProgramImmutableInitialization {
+    Complex64 {
+        scalar: ScalarType,
+        values: Vec<Complex64>,
+    },
+    ComplexDoubleDouble {
+        values: Vec<ComplexDoubleDouble>,
+    },
+    StockhamUnitRoots {
+        scalar: ScalarType,
+        len: usize,
+    },
+}
+
+impl VulkanProgramImmutableInitialization {
+    /// Materialize the exact native-endian storage bytes expected by Vulkan
+    /// shaders for this immutable allocation. Callers may cache/upload these
+    /// bytes; no Vulkan object or staging allocation is created here.
+    pub fn materialize_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Complex64 { scalar, values } => {
+                encode_program_complex64_values(*scalar, "caller-owned immutable LUT", values)
+            }
+            Self::ComplexDoubleDouble { values } => encode_program_double_double_values(
+                "caller-owned immutable double-double LUT",
+                values,
+            ),
+            Self::StockhamUnitRoots { scalar, len } => {
+                let roots = stockham_root_table(*len)?;
+                encode_program_complex64_values(*scalar, "caller-owned Stockham roots", &roots)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VulkanProgramAllocationInitialization {
+    /// External input contents are defined by the caller rather than vkfft-rs.
+    ExternalInput,
+    /// First use fully overwrites the allocation, so no pre-dispatch action is required.
+    NoInitialization,
+    /// The allocation must be zero before the first pass. Callers should normally
+    /// use `vkCmdFillBuffer` or an equivalent device-side clear instead of staging bytes.
+    ZeroFill,
+    /// Immutable provider-defined LUT/root contents; materialize only when the
+    /// caller needs upload bytes.
+    Immutable(VulkanProgramImmutableInitialization),
+}
+
+impl VulkanProgramAllocationInitialization {
+    pub const fn requires_pre_dispatch_action(&self) -> bool {
+        !matches!(self, Self::NoInitialization)
+    }
+
+    pub const fn is_provider_immutable(&self) -> bool {
+        matches!(self, Self::Immutable(_))
+    }
+
+    pub fn materialize_immutable_bytes(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Immutable(initialization) => initialization.materialize_bytes().map(Some),
+            Self::ExternalInput | Self::NoInitialization | Self::ZeroFill => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VulkanProgramAllocationPreparation {
+    pub allocation: ProgramAllocationId,
+    pub kind: ProgramAllocationKind,
+    pub scalar: ScalarType,
+    pub element_shape: ProgramElementShape,
+    pub elements: usize,
+    pub initialization: VulkanProgramAllocationInitialization,
+}
+
+impl VulkanProgramAllocationPreparation {
+    pub fn byte_len(&self) -> Result<vk::DeviceSize> {
+        program_allocation_bytes(self.elements, self.scalar, self.element_shape)
+    }
+}
+
+/// Provider-owned initialization contract for caller-owned ProgramIr storage.
+/// It is intentionally independent of Vulkan handles: Ferrion or another caller
+/// remains free to allocate/pool device memory and choose transfer/fill commands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VulkanProgramPreparationPlan {
+    pub allocations: Vec<VulkanProgramAllocationPreparation>,
+}
+
+impl VulkanProgramPreparationPlan {
+    pub fn new(program: &ProgramIr) -> Result<Self> {
+        program.validate()?;
+        let memory_plan = program.memory_plan()?;
+        let allocations = memory_plan
+            .allocations
+            .iter()
+            .map(|allocation| program_allocation_preparation(program, allocation))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { allocations })
+    }
+
+    pub fn allocation(
+        &self,
+        id: ProgramAllocationId,
+    ) -> Result<&VulkanProgramAllocationPreparation> {
+        self.allocations
+            .get(id.0)
+            .filter(|preparation| preparation.allocation == id)
+            .ok_or(VkFftError::InvalidKernelIr(
+                "Vulkan preparation plan references an unknown allocation",
+            ))
+    }
+}
+
+fn program_allocation_element_shape(
+    program: &ProgramIr,
+    allocation: &ProgramAllocation,
+) -> Result<ProgramElementShape> {
+    let first = allocation
+        .resources
+        .first()
+        .copied()
+        .ok_or(VkFftError::InvalidKernelIr(
+            "Vulkan physical allocation has no logical resources",
+        ))?;
+    let shape = program.resource(first)?.element_shape();
+    for resource_id in allocation.resources.iter().skip(1) {
+        if program.resource(*resource_id)?.element_shape() != shape {
+            return Err(VkFftError::InvalidKernelIr(
+                "Vulkan physical allocation aliases incompatible element shapes",
+            ));
+        }
+    }
+    Ok(shape)
+}
+
+fn program_allocation_bytes(
+    elements: usize,
+    scalar: ScalarType,
+    element_shape: ProgramElementShape,
+) -> Result<vk::DeviceSize> {
+    let bytes = elements
+        .checked_mul(element_shape.element_bytes(scalar))
+        .ok_or(VkFftError::ArithmeticOverflow {
+            operation: "Vulkan caller-owned program allocation byte size",
+        })?;
+    vk::DeviceSize::try_from(bytes).map_err(|_| VkFftError::ValueOutOfRange {
+        field: "Vulkan caller-owned program allocation byte size",
+    })
+}
+
+fn program_allocation_byte_len(
+    program: &ProgramIr,
+    allocation: &ProgramAllocation,
+) -> Result<vk::DeviceSize> {
+    program_allocation_bytes(
+        allocation.elements,
+        allocation.scalar,
+        program_allocation_element_shape(program, allocation)?,
+    )
+}
+
+fn zeroed_resource_requires_initialization(first_access: Option<BufferAccess>) -> bool {
+    matches!(
+        first_access,
+        Some(BufferAccess::ReadOnly | BufferAccess::ReadWrite)
+    )
+}
+
+fn program_allocation_preparation(
+    program: &ProgramIr,
+    allocation: &ProgramAllocation,
+) -> Result<VulkanProgramAllocationPreparation> {
+    let mut immutable = None;
+    let mut external_input = false;
+    let mut zero_fill = false;
+    for resource_id in &allocation.resources {
+        let resource = program.resource(*resource_id)?;
+        match &resource.initialization {
+            ProgramResourceInitialization::ExternalInput => external_input = true,
+            ProgramResourceInitialization::Zeroed => {
+                let first_access = program.passes.iter().find_map(|pass| {
+                    pass.bindings
+                        .iter()
+                        .find(|binding| binding.resource == *resource_id)
+                        .map(|binding| binding.access)
+                });
+                zero_fill |= zeroed_resource_requires_initialization(first_access);
+            }
+            ProgramResourceInitialization::Complex64(values) => {
+                if immutable.is_some() {
+                    return Err(VkFftError::InvalidKernelIr(
+                        "Vulkan physical allocation contains multiple immutable initializers",
+                    ));
+                }
+                immutable = Some(VulkanProgramImmutableInitialization::Complex64 {
+                    scalar: resource.scalar,
+                    values: values.clone(),
+                });
+            }
+            ProgramResourceInitialization::ComplexDoubleDouble(values) => {
+                if immutable.is_some() {
+                    return Err(VkFftError::InvalidKernelIr(
+                        "Vulkan physical allocation contains multiple immutable initializers",
+                    ));
+                }
+                immutable = Some(VulkanProgramImmutableInitialization::ComplexDoubleDouble {
+                    values: values.clone(),
+                });
+            }
+            ProgramResourceInitialization::StockhamUnitRoots { len } => {
+                if immutable.is_some() {
+                    return Err(VkFftError::InvalidKernelIr(
+                        "Vulkan physical allocation contains multiple immutable initializers",
+                    ));
+                }
+                immutable = Some(VulkanProgramImmutableInitialization::StockhamUnitRoots {
+                    scalar: resource.scalar,
+                    len: *len,
+                });
+            }
+        }
+    }
+
+    let initialization = if external_input {
+        if immutable.is_some()
+            || zero_fill
+            || allocation.kind != ProgramAllocationKind::ExternalInput
+        {
+            return Err(VkFftError::InvalidKernelIr(
+                "Vulkan external-input allocation has incompatible initialization aliases",
+            ));
+        }
+        VulkanProgramAllocationInitialization::ExternalInput
+    } else if let Some(immutable) = immutable {
+        if zero_fill || allocation.kind != ProgramAllocationKind::LookupTable {
+            return Err(VkFftError::InvalidKernelIr(
+                "Vulkan immutable allocation has incompatible physical allocation kind",
+            ));
+        }
+        VulkanProgramAllocationInitialization::Immutable(immutable)
+    } else if zero_fill {
+        VulkanProgramAllocationInitialization::ZeroFill
+    } else {
+        VulkanProgramAllocationInitialization::NoInitialization
+    };
+
+    let element_shape = program_allocation_element_shape(program, allocation)?;
+    let preparation = VulkanProgramAllocationPreparation {
+        allocation: allocation.id,
+        kind: allocation.kind,
+        scalar: allocation.scalar,
+        element_shape,
+        elements: allocation.elements,
+        initialization,
+    };
+    let _ = preparation.byte_len()?;
+    Ok(preparation)
+}
+
+fn encode_program_complex64_values(
+    scalar: ScalarType,
+    name: &str,
+    values: &[Complex64],
+) -> Result<Vec<u8>> {
+    match scalar {
+        ScalarType::F16 => Err(VkFftError::UnsupportedPrecision {
+            backend: "Vulkan runtime LUT",
+            precision: "binary16 LUT storage is not part of F16-storage/F32-compute",
+        }),
+        ScalarType::DoubleDouble => Err(VkFftError::UnsupportedPrecision {
+            backend: "Vulkan runtime LUT",
+            precision: "Complex64 LUT initialization cannot populate double-double storage",
+        }),
+        ScalarType::F64 => {
+            if values
+                .iter()
+                .any(|value| !value.re.is_finite() || !value.im.is_finite())
+            {
+                return Err(VkFftError::VulkanRuntime(format!(
+                    "program LUT `{name}` contains a non-finite F64 value"
+                )));
+            }
+            let mut bytes = Vec::with_capacity(values.len() * core::mem::size_of::<Complex64>());
+            for value in values {
+                bytes.extend_from_slice(&value.re.to_ne_bytes());
+                bytes.extend_from_slice(&value.im.to_ne_bytes());
+            }
+            Ok(bytes)
+        }
+        ScalarType::F32 => {
+            let mut bytes = Vec::with_capacity(values.len() * core::mem::size_of::<Complex32>());
+            for value in values {
+                let re = value.re as f32;
+                let im = value.im as f32;
+                if !re.is_finite() || !im.is_finite() {
+                    return Err(VkFftError::VulkanRuntime(format!(
+                        "program LUT `{name}` contains a value that cannot be represented as F32"
+                    )));
+                }
+                bytes.extend_from_slice(&re.to_ne_bytes());
+                bytes.extend_from_slice(&im.to_ne_bytes());
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn encode_program_double_double_values(
+    name: &str,
+    values: &[ComplexDoubleDouble],
+) -> Result<Vec<u8>> {
+    if values.iter().any(|value| {
+        !value.re.hi.is_finite()
+            || !value.re.lo.is_finite()
+            || !value.im.hi.is_finite()
+            || !value.im.lo.is_finite()
+    }) {
+        return Err(VkFftError::VulkanRuntime(format!(
+            "program LUT `{name}` contains a non-finite double-double component"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(values.len() * core::mem::size_of::<ComplexDoubleDouble>());
+    for value in values {
+        bytes.extend_from_slice(&value.re.hi.to_ne_bytes());
+        bytes.extend_from_slice(&value.re.lo.to_ne_bytes());
+        bytes.extend_from_slice(&value.im.hi.to_ne_bytes());
+        bytes.extend_from_slice(&value.im.lo.to_ne_bytes());
+    }
+    Ok(bytes)
 }
 
 /// Vulkan's portable identity tuple for persisted pipeline-cache data. Cache bytes
@@ -1384,7 +1797,7 @@ impl VulkanExecutionContext {
             .enumerate()
         {
             if upload_required[index] && allocation.kind != ProgramAllocationKind::ExternalInput {
-                write_zeroed_program_allocation(buffer, allocation)?;
+                write_zeroed_program_allocation(program, buffer, allocation)?;
             }
         }
         let mut initialized_allocations = vec![false; memory_plan.allocations.len()];
@@ -1992,17 +2405,7 @@ impl VulkanExecutionContext {
                         "Vulkan resident-chain input must map to ExternalInput",
                     ));
                 }
-                let expected_bytes = allocation
-                    .elements
-                    .checked_mul(allocation.scalar.complex_bytes())
-                    .ok_or(VkFftError::ArithmeticOverflow {
-                        operation: "Vulkan resident-chain input byte size",
-                    })?;
-                let expected_bytes = vk::DeviceSize::try_from(expected_bytes).map_err(|_| {
-                    VkFftError::ValueOutOfRange {
-                        field: "Vulkan resident-chain input byte size",
-                    }
-                })?;
+                let expected_bytes = program_allocation_byte_len(program, allocation)?;
                 if resident.buffer.size != expected_bytes {
                     return Err(VkFftError::InvalidKernelIr(
                         "Vulkan resident-chain adjacent physical allocation sizes differ",
@@ -2033,7 +2436,7 @@ impl VulkanExecutionContext {
             .enumerate()
         {
             if upload_required[index] && allocation.kind != ProgramAllocationKind::ExternalInput {
-                write_zeroed_program_allocation(buffer, allocation)?;
+                write_zeroed_program_allocation(program, buffer, allocation)?;
             }
         }
         let mut initialized_allocations = vec![false; memory_plan.allocations.len()];
@@ -2931,7 +3334,7 @@ impl VulkanExecutionContext {
             .enumerate()
         {
             if upload_required[index] {
-                write_zeroed_program_allocation(buffer, allocation)?;
+                write_zeroed_program_allocation(program, buffer, allocation)?;
             }
         }
         let mut initialized_allocations = vec![false; memory_plan.allocations.len()];
@@ -3106,7 +3509,7 @@ impl VulkanExecutionContext {
             .enumerate()
         {
             if upload_required[index] {
-                write_zeroed_program_allocation(buffer, allocation)?;
+                write_zeroed_program_allocation(program, buffer, allocation)?;
             }
         }
         let mut initialized_allocations = vec![false; memory_plan.allocations.len()];
@@ -3484,13 +3887,6 @@ impl VulkanExecutionContext {
         }
     }
 
-    fn zeroed_resource_requires_initial_upload(first_access: Option<BufferAccess>) -> bool {
-        matches!(
-            first_access,
-            Some(BufferAccess::ReadOnly | BufferAccess::ReadWrite)
-        )
-    }
-
     fn write_complex32_external_input(
         buffer: &HostVisibleStorageBuffer,
         resource: &crate::program_ir::ProgramResource,
@@ -3552,27 +3948,9 @@ impl VulkanExecutionContext {
         program: &ProgramIr,
         allocation: &ProgramAllocation,
     ) -> Result<bool> {
-        for resource_id in &allocation.resources {
-            let resource = program.resource(*resource_id)?;
-            match &resource.initialization {
-                ProgramResourceInitialization::ExternalInput
-                | ProgramResourceInitialization::Complex64(_)
-                | ProgramResourceInitialization::ComplexDoubleDouble(_)
-                | ProgramResourceInitialization::StockhamUnitRoots { .. } => return Ok(true),
-                ProgramResourceInitialization::Zeroed => {
-                    let first_access = program.passes.iter().find_map(|pass| {
-                        pass.bindings
-                            .iter()
-                            .find(|binding| binding.resource == *resource_id)
-                            .map(|binding| binding.access)
-                    });
-                    if Self::zeroed_resource_requires_initial_upload(first_access) {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+        Ok(program_allocation_preparation(program, allocation)?
+            .initialization
+            .requires_pre_dispatch_action())
     }
 
     fn allocate_program_storage(
@@ -3587,16 +3965,7 @@ impl VulkanExecutionContext {
             pending_luts: Vec::new(),
         };
         for (allocation_index, allocation) in memory_plan.allocations.iter().enumerate() {
-            let bytes = allocation
-                .elements
-                .checked_mul(allocation.scalar.complex_bytes())
-                .ok_or(VkFftError::ArithmeticOverflow {
-                    operation: "Vulkan program allocation byte size",
-                })?;
-            let bytes =
-                vk::DeviceSize::try_from(bytes).map_err(|_| VkFftError::ValueOutOfRange {
-                    field: "Vulkan program allocation byte size",
-                })?;
+            let bytes = program_allocation_byte_len(program, allocation)?;
             storage.staging.push(self.take_staging_buffer(bytes)?);
 
             if allocation.kind == ProgramAllocationKind::LookupTable {
@@ -5600,14 +5969,38 @@ impl HostVisibleStorageBuffer {
 }
 
 fn write_zeroed_program_allocation(
+    program: &ProgramIr,
     buffer: &HostVisibleStorageBuffer,
     allocation: &ProgramAllocation,
 ) -> Result<()> {
-    match allocation.scalar {
-        ScalarType::F16 => buffer.write_complex16(&vec![Complex16::default(); allocation.elements]),
-        ScalarType::F32 => buffer.write_complex32(&vec![Complex32::default(); allocation.elements]),
-        ScalarType::F64 => buffer.write_complex64(&vec![Complex64::default(); allocation.elements]),
-        ScalarType::DoubleDouble => buffer.write_elements(&vec![[0u64; 4]; allocation.elements]),
+    match (
+        program_allocation_element_shape(program, allocation)?,
+        allocation.scalar,
+    ) {
+        (ProgramElementShape::Scalar, ScalarType::F16) => {
+            buffer.write_elements(&vec![0u16; allocation.elements])
+        }
+        (ProgramElementShape::Scalar, ScalarType::F32) => {
+            buffer.write_elements(&vec![0.0f32; allocation.elements])
+        }
+        (ProgramElementShape::Scalar, ScalarType::F64) => {
+            buffer.write_elements(&vec![0.0f64; allocation.elements])
+        }
+        (ProgramElementShape::Scalar, ScalarType::DoubleDouble) => {
+            buffer.write_elements(&vec![[0u64; 2]; allocation.elements])
+        }
+        (ProgramElementShape::Complex, ScalarType::F16) => {
+            buffer.write_complex16(&vec![Complex16::default(); allocation.elements])
+        }
+        (ProgramElementShape::Complex, ScalarType::F32) => {
+            buffer.write_complex32(&vec![Complex32::default(); allocation.elements])
+        }
+        (ProgramElementShape::Complex, ScalarType::F64) => {
+            buffer.write_complex64(&vec![Complex64::default(); allocation.elements])
+        }
+        (ProgramElementShape::Complex, ScalarType::DoubleDouble) => {
+            buffer.write_elements(&vec![[0u64; 4]; allocation.elements])
+        }
     }
 }
 
@@ -6281,6 +6674,189 @@ impl Drop for VulkanComputePipeline {
     }
 }
 
+/// Prepared whole-ProgramIr Vulkan recorder for caller-owned allocations and a
+/// caller-owned command buffer. The recorder never allocates, uploads, submits,
+/// waits for, or reads back the supplied buffers.
+pub struct VulkanProgramRecorder {
+    device: Arc<Device>,
+    plan: VulkanProgramRecordingPlan,
+    pipelines: Vec<VulkanComputePipeline>,
+}
+
+impl core::fmt::Debug for VulkanProgramRecorder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VulkanProgramRecorder")
+            .field("plan", &self.plan)
+            .field("pipeline_count", &self.pipelines.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VulkanProgramRecorder {
+    /// Build one pipeline per ProgramIr pass on a caller-owned logical device.
+    ///
+    /// # Safety
+    ///
+    /// `device` must remain a live Vulkan logical device for the recorder's
+    /// lifetime. Every shader must have been generated for `program` and for a
+    /// device profile compatible with the logical device's enabled features.
+    pub unsafe fn new(
+        device: Arc<Device>,
+        program: &ProgramIr,
+        shaders: &[VulkanSpirvShader],
+    ) -> Result<Self> {
+        program.validate()?;
+        if shaders.len() != program.passes.len() {
+            return Err(VkFftError::VulkanRuntime(format!(
+                "program declares {} passes but {} shaders were supplied",
+                program.passes.len(),
+                shaders.len()
+            )));
+        }
+        let plan = VulkanProgramRecordingPlan::new(program)?;
+        let mut pipelines = Vec::with_capacity(shaders.len());
+        for (pass, shader) in program.passes.iter().zip(shaders) {
+            validate_program_pass_shader(program, pass, shader)?;
+            pipelines.push(unsafe { VulkanComputePipeline::new(Arc::clone(&device), shader)? });
+        }
+        Ok(Self {
+            device,
+            plan,
+            pipelines,
+        })
+    }
+
+    pub const fn recording_plan(&self) -> &VulkanProgramRecordingPlan {
+        &self.plan
+    }
+
+    /// Bind physical ProgramIr allocations and append all dispatches to an
+    /// already-recording caller-owned command buffer. Internal compute hazards are
+    /// bridged between passes. The caller owns synchronization before the first
+    /// pass and after the final pass, allocation initialization (including LUTs and
+    /// read-before-write scratch), queue submission, and command-buffer lifetime.
+    ///
+    /// One recorder mutates one descriptor set per pass and is therefore
+    /// externally synchronized: do not rebind it while a previously recorded
+    /// command buffer using those descriptor sets is pending execution.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` and every buffer slice must belong to `self.device` and
+    /// satisfy Vulkan storage-buffer usage, memory binding, synchronization, and
+    /// lifetime rules. Allocation contents must satisfy the corresponding
+    /// [`ProgramResourceInitialization`] requirements before execution.
+    pub unsafe fn record(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        allocations: &[(ProgramAllocationId, VulkanBufferSlice)],
+    ) -> Result<()> {
+        if command_buffer == vk::CommandBuffer::null() {
+            return Err(VkFftError::VulkanRuntime(
+                "caller-owned Vulkan program command buffer must not be null".to_owned(),
+            ));
+        }
+        let mut resolved = vec![None; self.plan.memory_plan.allocations.len()];
+        for (id, slice) in allocations {
+            let allocation = self
+                .plan
+                .memory_plan
+                .allocations
+                .get(id.0)
+                .filter(|allocation| allocation.id == *id)
+                .ok_or(VkFftError::InvalidKernelIr(
+                    "caller-owned Vulkan program supplied an unknown allocation",
+                ))?;
+            let slot = resolved.get_mut(id.0).ok_or(VkFftError::InvalidKernelIr(
+                "caller-owned Vulkan program allocation index is out of range",
+            ))?;
+            if slot.is_some() {
+                return Err(VkFftError::InvalidKernelIr(
+                    "caller-owned Vulkan program supplied an allocation more than once",
+                ));
+            }
+            validate_buffer_slice("program allocation", *slice)?;
+            let required = self.plan.allocation_bytes(allocation.id)?;
+            if slice.range != vk::WHOLE_SIZE && slice.range < required {
+                return Err(VkFftError::VulkanRuntime(format!(
+                    "caller-owned Vulkan allocation {} exposes {} bytes but requires at least {}",
+                    id.0, slice.range, required
+                )));
+            }
+            *slot = Some(*slice);
+        }
+        if resolved.iter().any(Option::is_none) {
+            return Err(VkFftError::InvalidKernelIr(
+                "caller-owned Vulkan program did not supply every physical allocation",
+            ));
+        }
+
+        for (pass_index, (pass, pipeline)) in
+            self.plan.passes.iter().zip(&self.pipelines).enumerate()
+        {
+            let bindings = pass
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let slice = resolved
+                        .get(binding.allocation.0)
+                        .and_then(|slice| *slice)
+                        .ok_or(VkFftError::InvalidKernelIr(
+                            "caller-owned Vulkan pass references a missing allocation",
+                        ))?;
+                    Ok((binding.binding, slice))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            unsafe { pipeline.update_storage_buffers(&bindings)? };
+            unsafe { pipeline.record_dispatch(command_buffer) };
+
+            if pass_index + 1 == self.pipelines.len() {
+                continue;
+            }
+            let mut written = Vec::<ProgramAllocationId>::new();
+            for binding in &pass.bindings {
+                if matches!(
+                    binding.access,
+                    BufferAccess::WriteOnly | BufferAccess::ReadWrite
+                ) && !written.contains(&binding.allocation)
+                {
+                    written.push(binding.allocation);
+                }
+            }
+            let barriers = written
+                .into_iter()
+                .map(|allocation| {
+                    let slice = resolved[allocation.0].expect("validated allocation mapping");
+                    vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(slice.buffer)
+                        .offset(slice.offset)
+                        .size(slice.range)
+                })
+                .collect::<Vec<_>>();
+            if !barriers.is_empty() {
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &barriers,
+                        &[],
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_program_pass_shader(
     program: &ProgramIr,
     pass: &ProgramPass,
@@ -6469,6 +7045,788 @@ mod tests {
             .unwrap()
     }
 
+    fn execute_caller_owned_transform_complex32(
+        context: &VulkanExecutionContext,
+        transform: &crate::TransformIr,
+        input: &[Complex32],
+    ) -> Vec<Complex32> {
+        let program = transform.program_ir().unwrap();
+        let shaders = VulkanGlslBackend
+            .lower_transform(transform)
+            .unwrap()
+            .into_iter()
+            .map(|shader| shader.compile_spirv())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let recorder = unsafe {
+            VulkanProgramRecorder::new(Arc::clone(&context.device), &program, &shaders).unwrap()
+        };
+        let memory_plan = program.memory_plan().unwrap();
+        let preparation = VulkanProgramPreparationPlan::new(&program).unwrap();
+        assert_eq!(preparation.allocations.len(), memory_plan.allocations.len());
+        let input_resource = program.input_resource().unwrap();
+        let input_layout = input_resource.external_layout.unwrap();
+        assert_eq!(input_layout.element_shape, ProgramElementShape::Complex);
+        assert_eq!(input_layout.logical_len, input_layout.physical_stride);
+        assert_eq!(input.len(), input_resource.elements);
+
+        let device_allocations = preparation
+            .allocations
+            .iter()
+            .map(|allocation| {
+                Arc::new(
+                    DeviceLocalStorageBuffer::new(
+                        Arc::clone(&context.device),
+                        context.memory_properties,
+                        allocation.byte_len().unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let upload_staging = preparation
+            .allocations
+            .iter()
+            .map(|allocation| match &allocation.initialization {
+                VulkanProgramAllocationInitialization::NoInitialization => None,
+                VulkanProgramAllocationInitialization::ExternalInput => {
+                    let staging = context
+                        .take_staging_buffer(allocation.byte_len().unwrap())
+                        .unwrap();
+                    staging.write_complex32(input).unwrap();
+                    Some(staging)
+                }
+                VulkanProgramAllocationInitialization::ZeroFill => {
+                    let staging = context
+                        .take_staging_buffer(allocation.byte_len().unwrap())
+                        .unwrap();
+                    let bytes = usize::try_from(allocation.byte_len().unwrap()).unwrap();
+                    staging.write_elements(&vec![0u8; bytes]).unwrap();
+                    Some(staging)
+                }
+                VulkanProgramAllocationInitialization::Immutable(_) => {
+                    let staging = context
+                        .take_staging_buffer(allocation.byte_len().unwrap())
+                        .unwrap();
+                    let bytes = allocation
+                        .initialization
+                        .materialize_immutable_bytes()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        bytes.len() as vk::DeviceSize,
+                        allocation.byte_len().unwrap()
+                    );
+                    staging.write_elements(&bytes).unwrap();
+                    Some(staging)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let allocation_slices = memory_plan
+            .allocations
+            .iter()
+            .zip(&device_allocations)
+            .map(|(allocation, buffer)| (allocation.id, buffer.as_slice()))
+            .collect::<Vec<_>>();
+        let output_resource = program.output_resource().unwrap();
+        let output_allocation = memory_plan.allocation_for(output_resource.id).unwrap();
+        let output_layout = output_resource.external_layout.unwrap();
+        let output_device = &device_allocations[output_allocation.0];
+        let output_staging = context.take_staging_buffer(output_device.size).unwrap();
+
+        let slot = context.take_submission_slot().unwrap();
+        let command_buffer = slot.command_buffer;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            context
+                .device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .unwrap();
+        }
+        let host_to_transfer = upload_staging
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|allocation| {
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(allocation.buffer)
+                    .offset(0)
+                    .size(allocation.size)
+            })
+            .collect::<Vec<_>>();
+        if !host_to_transfer.is_empty() {
+            unsafe {
+                context.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &host_to_transfer,
+                    &[],
+                );
+            }
+        }
+        unsafe {
+            for (staging, device_local) in upload_staging.iter().zip(&device_allocations) {
+                if let Some(staging) = staging {
+                    context.device.cmd_copy_buffer(
+                        command_buffer,
+                        staging.buffer,
+                        device_local.buffer,
+                        &[vk::BufferCopy::default().size(staging.size)],
+                    );
+                }
+            }
+        }
+        let transfer_to_compute = device_allocations
+            .iter()
+            .zip(&upload_staging)
+            .filter(|(_, staging)| staging.is_some())
+            .map(|(allocation, _)| {
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(allocation.buffer)
+                    .offset(0)
+                    .size(allocation.size)
+            })
+            .collect::<Vec<_>>();
+        if !transfer_to_compute.is_empty() {
+            unsafe {
+                context.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &transfer_to_compute,
+                    &[],
+                );
+            }
+        }
+        unsafe {
+            recorder.record(command_buffer, &allocation_slices).unwrap();
+        }
+        let compute_to_transfer = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_device.buffer)
+            .offset(0)
+            .size(output_device.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &compute_to_transfer,
+                &[],
+            );
+            context.device.cmd_copy_buffer(
+                command_buffer,
+                output_device.buffer,
+                output_staging.buffer,
+                &[vk::BufferCopy::default().size(output_device.size)],
+            );
+        }
+        let transfer_to_host = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_staging.buffer)
+            .offset(0)
+            .size(output_staging.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &transfer_to_host,
+                &[],
+            );
+            context.device.end_command_buffer(command_buffer).unwrap();
+            context
+                .device
+                .queue_submit(
+                    context.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                    slot.fence,
+                )
+                .unwrap();
+            context
+                .device
+                .wait_for_fences(&[slot.fence], true, u64::MAX)
+                .unwrap();
+        }
+        let physical = output_staging
+            .read_complex32(output_resource.elements)
+            .unwrap();
+        let output =
+            VulkanExecutionContext::unpack_complex32_output(physical, output_layout).unwrap();
+        context.recycle_submission_slot(slot).unwrap();
+        output
+    }
+
+    #[test]
+    fn caller_owned_preparation_plan_covers_zero_fill_and_lazy_immutable_payloads() {
+        let plan = FftPlan::build(FftConfig::new(vec![32])).unwrap();
+        let mut profile = DeviceProfile::generic(Backend::Vulkan, GpuVendor::Nvidia);
+        profile.shared_memory_bytes = 128 * 1024;
+        profile.shared_memory_pow2_bytes = 128 * 1024;
+        let kernel = KernelIr::stockham_1d(&plan, Direction::Forward, profile).unwrap();
+        let mut zero_program = ProgramIr::stockham(&kernel).unwrap();
+        let output_id = zero_program.output_resource().unwrap().id;
+        zero_program
+            .passes
+            .iter_mut()
+            .flat_map(|pass| &mut pass.bindings)
+            .filter(|binding| binding.resource == output_id)
+            .for_each(|binding| binding.access = BufferAccess::ReadWrite);
+        zero_program.validate().unwrap();
+        let zero_memory = zero_program.memory_plan().unwrap();
+        let zero_preparation = VulkanProgramPreparationPlan::new(&zero_program).unwrap();
+        let output_allocation = zero_memory.allocation_for(output_id).unwrap();
+        assert!(matches!(
+            zero_preparation
+                .allocation(output_allocation)
+                .unwrap()
+                .initialization,
+            VulkanProgramAllocationInitialization::ZeroFill
+        ));
+        assert!(
+            zero_preparation
+                .allocation(output_allocation)
+                .unwrap()
+                .initialization
+                .materialize_immutable_bytes()
+                .unwrap()
+                .is_none()
+        );
+
+        let rader =
+            crate::TransformIr::build(FftConfig::new(vec![17]), Direction::Forward, profile)
+                .unwrap();
+        let rader_program = rader.program_ir().unwrap();
+        let preparation = VulkanProgramPreparationPlan::new(&rader_program).unwrap();
+        let memory = rader_program.memory_plan().unwrap();
+        let input_allocation = memory
+            .allocation_for(rader_program.input_resource().unwrap().id)
+            .unwrap();
+        let output_allocation = memory
+            .allocation_for(rader_program.output_resource().unwrap().id)
+            .unwrap();
+        assert!(matches!(
+            preparation
+                .allocation(input_allocation)
+                .unwrap()
+                .initialization,
+            VulkanProgramAllocationInitialization::ExternalInput
+        ));
+        assert!(matches!(
+            preparation
+                .allocation(output_allocation)
+                .unwrap()
+                .initialization,
+            VulkanProgramAllocationInitialization::NoInitialization
+        ));
+
+        let immutable = preparation
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.initialization.is_provider_immutable())
+            .collect::<Vec<_>>();
+        assert!(!immutable.is_empty());
+        for allocation in immutable {
+            let bytes = allocation
+                .initialization
+                .materialize_immutable_bytes()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                bytes.len() as vk::DeviceSize,
+                allocation.byte_len().unwrap()
+            );
+            assert!(bytes.iter().any(|byte| *byte != 0));
+        }
+    }
+
+    #[test]
+    fn scalar_external_preparation_uses_scalar_byte_width() {
+        let mut profile = DeviceProfile::generic(Backend::Vulkan, GpuVendor::Nvidia);
+        profile.shared_memory_bytes = 128 * 1024;
+        profile.shared_memory_pow2_bytes = 128 * 1024;
+        for (transform, direction) in [
+            (crate::TransformKind::RealToComplex, Direction::Forward),
+            (crate::TransformKind::ComplexToReal, Direction::Inverse),
+        ] {
+            let ir = crate::TransformIr::build(
+                FftConfig::new(vec![8])
+                    .with_transform(transform)
+                    .with_precision(crate::Precision::DoubleDoubleF64Storage),
+                direction,
+                profile,
+            )
+            .unwrap();
+            let program = ir.program_ir().unwrap();
+            let memory = program.memory_plan().unwrap();
+            let preparation = VulkanProgramPreparationPlan::new(&program).unwrap();
+            let input_resource = program.input_resource().unwrap();
+            let output_resource = program.output_resource().unwrap();
+            let input_id = memory.allocation_for(input_resource.id).unwrap();
+            let output_id = memory.allocation_for(output_resource.id).unwrap();
+            let input = preparation.allocation(input_id).unwrap();
+            let output = preparation.allocation(output_id).unwrap();
+
+            match transform {
+                crate::TransformKind::RealToComplex => {
+                    assert_eq!(input.element_shape, ProgramElementShape::Scalar);
+                    assert_eq!(output.element_shape, ProgramElementShape::Complex);
+                    assert_eq!(input.byte_len().unwrap() as usize, input.elements * 8);
+                    assert_eq!(output.byte_len().unwrap() as usize, output.elements * 16);
+                }
+                crate::TransformKind::ComplexToReal => {
+                    assert_eq!(input.element_shape, ProgramElementShape::Complex);
+                    assert_eq!(output.element_shape, ProgramElementShape::Scalar);
+                    assert_eq!(input.byte_len().unwrap() as usize, input.elements * 16);
+                    assert_eq!(output.byte_len().unwrap() as usize, output.elements * 8);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn caller_owned_program_recorder_rejects_incomplete_duplicate_unknown_and_short_allocations() {
+        let context = match VulkanExecutionContext::new() {
+            Ok(context) => context,
+            Err(VkFftError::VulkanUnavailable(_)) => return,
+            Err(error) => {
+                panic!("Vulkan caller-owned recorder validation bootstrap failed: {error}")
+            }
+        };
+        let transform = crate::TransformIr::build(
+            FftConfig::new(vec![8]),
+            Direction::Forward,
+            context.device_profile(),
+        )
+        .unwrap();
+        let program = transform.program_ir().unwrap();
+        let shaders = VulkanGlslBackend
+            .lower_transform(&transform)
+            .unwrap()
+            .into_iter()
+            .map(|shader| shader.compile_spirv())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let recorder = unsafe {
+            VulkanProgramRecorder::new(Arc::clone(&context.device), &program, &shaders).unwrap()
+        };
+        let allocations = recorder
+            .recording_plan()
+            .memory_plan
+            .allocations
+            .iter()
+            .map(|allocation| {
+                let bytes = recorder
+                    .recording_plan()
+                    .allocation_bytes(allocation.id)
+                    .unwrap();
+                (
+                    allocation.id,
+                    Arc::new(
+                        DeviceLocalStorageBuffer::new(
+                            Arc::clone(&context.device),
+                            context.memory_properties,
+                            bytes,
+                        )
+                        .unwrap(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(allocations.len(), 2);
+        let first = (allocations[0].0, allocations[0].1.as_slice());
+        let second = (allocations[1].0, allocations[1].1.as_slice());
+        let slot = context.take_submission_slot().unwrap();
+        let command_buffer = slot.command_buffer;
+
+        let missing = unsafe { recorder.record(command_buffer, &[first]) }.unwrap_err();
+        assert!(
+            matches!(missing, VkFftError::InvalidKernelIr(message) if message.contains("did not supply every physical allocation"))
+        );
+
+        let duplicate =
+            unsafe { recorder.record(command_buffer, &[first, first, second]) }.unwrap_err();
+        assert!(
+            matches!(duplicate, VkFftError::InvalidKernelIr(message) if message.contains("more than once"))
+        );
+
+        let unknown = unsafe {
+            recorder.record(
+                command_buffer,
+                &[(ProgramAllocationId(usize::MAX), first.1), second],
+            )
+        }
+        .unwrap_err();
+        assert!(
+            matches!(unknown, VkFftError::InvalidKernelIr(message) if message.contains("unknown allocation"))
+        );
+
+        let required = recorder.recording_plan().allocation_bytes(first.0).unwrap();
+        assert!(required > 1);
+        let short = (
+            first.0,
+            VulkanBufferSlice {
+                range: required - 1,
+                ..first.1
+            },
+        );
+        let short_error = unsafe { recorder.record(command_buffer, &[short, second]) }.unwrap_err();
+        assert!(
+            matches!(short_error, VkFftError::VulkanRuntime(message) if message.contains("requires at least"))
+        );
+
+        let null_error =
+            unsafe { recorder.record(vk::CommandBuffer::null(), &[first, second]) }.unwrap_err();
+        assert!(
+            matches!(null_error, VkFftError::VulkanRuntime(message) if message.contains("command buffer must not be null"))
+        );
+
+        context.recycle_submission_slot(slot).unwrap();
+    }
+
+    #[test]
+    fn caller_owned_program_recording_plan_maps_every_transform_pass_to_allocations() {
+        let mut profile = DeviceProfile::generic(Backend::Vulkan, GpuVendor::Nvidia);
+        profile.shared_memory_bytes = 128 * 1024;
+        profile.shared_memory_pow2_bytes = 128 * 1024;
+        let transform = crate::TransformIr::build(
+            FftConfig::new(vec![4, 6, 8]).with_transform(crate::TransformKind::RealToComplex),
+            Direction::Forward,
+            profile,
+        )
+        .unwrap();
+        let program = transform.program_ir().unwrap();
+        let plan = VulkanProgramRecordingPlan::new(&program).unwrap();
+        assert_eq!(plan.passes.len(), program.passes.len());
+        assert_eq!(plan.memory_plan, program.memory_plan().unwrap());
+        assert!(
+            plan.memory_plan
+                .allocations
+                .iter()
+                .all(|allocation| plan.allocation_bytes(allocation.id).unwrap() > 0)
+        );
+        for pass in &plan.passes {
+            assert!(!pass.bindings.is_empty());
+            assert!(pass.bindings.iter().all(|binding| {
+                plan.memory_plan
+                    .allocations
+                    .get(binding.allocation.0)
+                    .is_some_and(|allocation| allocation.id == binding.allocation)
+            }));
+        }
+    }
+
+    #[test]
+    fn caller_owned_program_recorder_executes_without_internal_staging_or_submission() {
+        let context = match VulkanExecutionContext::new() {
+            Ok(context) => context,
+            Err(VkFftError::VulkanUnavailable(_)) => return,
+            Err(error) => panic!("Vulkan caller-owned recorder bootstrap failed: {error}"),
+        };
+        let transform = crate::TransformIr::build(
+            FftConfig::new(vec![8]),
+            Direction::Forward,
+            context.device_profile(),
+        )
+        .unwrap();
+        let program = transform.program_ir().unwrap();
+        let memory_plan = program.memory_plan().unwrap();
+        assert_eq!(
+            memory_plan
+                .allocations
+                .iter()
+                .map(|allocation| allocation.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ProgramAllocationKind::ExternalInput,
+                ProgramAllocationKind::ExternalOutput
+            ]
+        );
+        let shaders = VulkanGlslBackend
+            .lower_transform(&transform)
+            .unwrap()
+            .into_iter()
+            .map(|shader| shader.compile_spirv())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let recorder = unsafe {
+            VulkanProgramRecorder::new(Arc::clone(&context.device), &program, &shaders).unwrap()
+        };
+
+        let device_allocations = recorder
+            .recording_plan()
+            .memory_plan
+            .allocations
+            .iter()
+            .map(|allocation| {
+                let bytes = recorder
+                    .recording_plan()
+                    .allocation_bytes(allocation.id)
+                    .unwrap();
+                Arc::new(
+                    DeviceLocalStorageBuffer::new(
+                        Arc::clone(&context.device),
+                        context.memory_properties,
+                        bytes,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let allocation_slices = recorder
+            .recording_plan()
+            .memory_plan
+            .allocations
+            .iter()
+            .zip(&device_allocations)
+            .map(|(allocation, buffer)| (allocation.id, buffer.as_slice()))
+            .collect::<Vec<_>>();
+        let input_allocation = memory_plan
+            .allocation_for(program.input_resource().unwrap().id)
+            .unwrap();
+        let output_allocation = memory_plan
+            .allocation_for(program.output_resource().unwrap().id)
+            .unwrap();
+        let input_device = &device_allocations[input_allocation.0];
+        let output_device = &device_allocations[output_allocation.0];
+
+        let input = (0..8)
+            .map(|index| {
+                let x = index as f32;
+                Complex32::new((0.31 * x).sin() + 0.02 * x, (0.17 * x).cos())
+            })
+            .collect::<Vec<_>>();
+        let expected = transform
+            .execute_complex_reference(
+                &input
+                    .iter()
+                    .map(|value| Complex64::new(f64::from(value.re), f64::from(value.im)))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let input_staging = context.take_staging_buffer(input_device.size).unwrap();
+        let output_staging = context.take_staging_buffer(output_device.size).unwrap();
+        input_staging.write_complex32(&input).unwrap();
+
+        let slot = context.take_submission_slot().unwrap();
+        let command_buffer = slot.command_buffer;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { context.device.begin_command_buffer(command_buffer, &begin) }.unwrap();
+        let host_to_transfer = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(input_staging.buffer)
+            .offset(0)
+            .size(input_staging.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &host_to_transfer,
+                &[],
+            );
+            context.device.cmd_copy_buffer(
+                command_buffer,
+                input_staging.buffer,
+                input_device.buffer,
+                &[vk::BufferCopy::default().size(input_device.size)],
+            );
+        }
+        let transfer_to_compute = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(input_device.buffer)
+            .offset(0)
+            .size(input_device.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &transfer_to_compute,
+                &[],
+            );
+            recorder.record(command_buffer, &allocation_slices).unwrap();
+        }
+        let compute_to_transfer = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_device.buffer)
+            .offset(0)
+            .size(output_device.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &compute_to_transfer,
+                &[],
+            );
+            context.device.cmd_copy_buffer(
+                command_buffer,
+                output_device.buffer,
+                output_staging.buffer,
+                &[vk::BufferCopy::default().size(output_device.size)],
+            );
+        }
+        let transfer_to_host = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(output_staging.buffer)
+            .offset(0)
+            .size(output_staging.size)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &transfer_to_host,
+                &[],
+            );
+            context.device.end_command_buffer(command_buffer).unwrap();
+            context
+                .device
+                .queue_submit(
+                    context.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                    slot.fence,
+                )
+                .unwrap();
+            context
+                .device
+                .wait_for_fences(&[slot.fence], true, u64::MAX)
+                .unwrap();
+        }
+        let actual = output_staging.read_complex32(8).unwrap();
+        for (actual, expected) in actual.iter().zip(&expected) {
+            let error =
+                (f64::from(actual.re) - expected.re).hypot(f64::from(actual.im) - expected.im);
+            assert!(error < 2.0e-5, "caller-owned Vulkan FFT error {error:e}");
+        }
+        context.recycle_submission_slot(slot).unwrap();
+        context
+            .recycle_staging_buffers([input_staging, output_staging])
+            .unwrap();
+    }
+
+    #[test]
+    fn caller_owned_program_recorder_executes_r2c_c2r_2d_3d_on_real_vulkan() {
+        let context = match VulkanExecutionContext::new() {
+            Ok(context) => context,
+            Err(VkFftError::VulkanUnavailable(_)) => return,
+            Err(error) => panic!("Vulkan caller-owned real recorder bootstrap failed: {error}"),
+        };
+        for dimensions in [vec![6, 8], vec![4, 6, 8]] {
+            let count = dimensions.iter().product::<usize>();
+            let real_input = (0..count)
+                .map(|index| {
+                    let x = index as f32;
+                    (0.037 * x).sin() + 0.17 * (0.021 * x).cos() + 0.0003 * x
+                })
+                .collect::<Vec<_>>();
+            let forward = crate::TransformIr::build(
+                FftConfig::new(dimensions.clone())
+                    .with_transform(crate::TransformKind::RealToComplex),
+                Direction::Forward,
+                context.device_profile(),
+            )
+            .unwrap();
+            let gpu_spectrum = execute_caller_owned_transform_complex32(
+                &context,
+                &forward,
+                &real_input
+                    .iter()
+                    .map(|value| Complex32::new(*value, 0.0))
+                    .collect::<Vec<_>>(),
+            );
+            let expected_spectrum = forward
+                .execute_r2c_reference(
+                    &real_input
+                        .iter()
+                        .map(|value| f64::from(*value))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            assert_eq!(gpu_spectrum.len(), expected_spectrum.len());
+            let max_forward_error = gpu_spectrum
+                .iter()
+                .zip(&expected_spectrum)
+                .map(|(actual, expected)| {
+                    (f64::from(actual.re) - expected.re).hypot(f64::from(actual.im) - expected.im)
+                })
+                .fold(0.0, f64::max);
+            assert!(
+                max_forward_error <= 2.0e-4 * count as f64,
+                "caller-owned Vulkan R2C error for {dimensions:?}: {max_forward_error:e}"
+            );
+
+            let inverse = crate::TransformIr::build(
+                FftConfig::new(dimensions.clone())
+                    .with_transform(crate::TransformKind::ComplexToReal)
+                    .with_inverse_normalization(true),
+                Direction::Inverse,
+                context.device_profile(),
+            )
+            .unwrap();
+            let gpu_restored =
+                execute_caller_owned_transform_complex32(&context, &inverse, &gpu_spectrum);
+            assert_eq!(gpu_restored.len(), real_input.len());
+            let max_inverse_error = gpu_restored
+                .iter()
+                .zip(&real_input)
+                .map(|(actual, expected)| (f64::from(actual.re) - f64::from(*expected)).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                max_inverse_error <= 3.0e-4 * count as f64,
+                "caller-owned Vulkan C2R error for {dimensions:?}: {max_inverse_error:e}"
+            );
+            assert!(gpu_restored.iter().all(|value| value.im.abs() <= 2.0e-4));
+        }
+    }
+
     #[test]
     fn explicit_device_index_zero_initializes_and_out_of_range_rejects_or_skip() {
         let context = match VulkanExecutionContext::new_with_device_index(0) {
@@ -6490,22 +7848,16 @@ mod tests {
 
     #[test]
     fn zeroed_program_upload_policy_respects_first_access() {
-        assert!(!VulkanExecutionContext::zeroed_resource_requires_initial_upload(None));
-        assert!(
-            !VulkanExecutionContext::zeroed_resource_requires_initial_upload(Some(
-                BufferAccess::WriteOnly,
-            ))
-        );
-        assert!(
-            VulkanExecutionContext::zeroed_resource_requires_initial_upload(Some(
-                BufferAccess::ReadOnly,
-            ))
-        );
-        assert!(
-            VulkanExecutionContext::zeroed_resource_requires_initial_upload(Some(
-                BufferAccess::ReadWrite,
-            ))
-        );
+        assert!(!zeroed_resource_requires_initialization(None));
+        assert!(!zeroed_resource_requires_initialization(Some(
+            BufferAccess::WriteOnly
+        )));
+        assert!(zeroed_resource_requires_initialization(Some(
+            BufferAccess::ReadOnly
+        )));
+        assert!(zeroed_resource_requires_initialization(Some(
+            BufferAccess::ReadWrite
+        )));
     }
 
     #[test]
